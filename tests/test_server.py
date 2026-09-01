@@ -122,5 +122,58 @@ class ConfigurationTests(unittest.TestCase):
             self.assertNotIn("api_key", server.public_settings())
 
 
+class ContextManagementTests(unittest.TestCase):
+    def setUp(self):
+        self.original_settings = server.SETTINGS
+
+    def tearDown(self):
+        server.configure(self.original_settings)
+
+    def test_tool_results_are_bounded_before_reentering_context(self):
+        server.configure(replace(server.SETTINGS, max_tool_result_chars=500))
+        serialized = server.serialize_tool_result({"url": "https://example.com", "text": "x" * 5000})
+        self.assertLessEqual(len(serialized), 500)
+        self.assertIn("compacted", serialized)
+
+    def test_preparation_discards_old_chat_before_current_request(self):
+        server.configure(replace(
+            server.SETTINGS,
+            context_window=8192,
+            context_reserve_tokens=2048,
+            max_tokens=1024,
+            max_tool_result_chars=500,
+            chars_per_token=1.0,
+            token_counting="estimate",
+        ))
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "old question " + "x" * 7000},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current question"},
+        ]
+        prepared, token_count = server.prepare_messages(messages, allow_tools=True)
+        self.assertEqual([item["content"] for item in prepared if item["role"] == "user"], ["current question"])
+        self.assertLessEqual(token_count, server.SETTINGS.context_window - server.SETTINGS.context_reserve_tokens)
+
+    def test_llama_token_counter_falls_back_to_estimate(self):
+        server.configure(replace(server.SETTINGS, token_counting="llama_cpp"))
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(server, "_post_json", side_effect=OSError("offline")):
+            count = server.prompt_token_count(messages, [])
+        self.assertEqual(count, server.estimate_prompt_tokens(messages, []))
+
+    def test_model_timeout_is_classified_for_safe_handling(self):
+        with patch.object(server.urllib.request, "urlopen", side_effect=TimeoutError("slow")):
+            with self.assertRaises(server.ModelTimeoutError):
+                server.call_model([{"role": "user", "content": "hello"}])
+
+    def test_context_retry_timeout_returns_a_safe_response(self):
+        failures = [server.ModelContextError("full"), server.ModelTimeoutError("slow")]
+        with patch.object(server, "call_model", side_effect=failures):
+            response = server.run_agent([{"role": "user", "content": "hello"}])
+        self.assertTrue(response["context"]["safely_stopped"])
+        self.assertEqual(response["usage"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

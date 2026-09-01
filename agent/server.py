@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 import http.client
 import ipaddress
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = APP_ROOT / "config.json"
 
@@ -46,11 +47,16 @@ class Settings:
     max_tokens: int
     request_timeout_seconds: int
     disable_thinking: bool
+    context_window: int
+    context_reserve_tokens: int
+    token_counting: str
+    chars_per_token: float
     workspace: Path
     static_root: Path
     max_body_bytes: int
     max_file_bytes: int
     max_fetch_bytes: int
+    max_tool_result_chars: int
     max_tool_rounds: int
     search_url_template: str
     allowed_web_ports: tuple[int, ...]
@@ -70,13 +76,18 @@ class Settings:
             api_key_env="LOCAL_AGENT_API_KEY",
             temperature=0.2,
             max_tokens=2048,
-            request_timeout_seconds=300,
+            request_timeout_seconds=900,
             disable_thinking=False,
+            context_window=8192,
+            context_reserve_tokens=2048,
+            token_counting="estimate",
+            chars_per_token=3.0,
             workspace=(APP_ROOT / "workspace").resolve(),
             static_root=(APP_ROOT / "ui" / "dist").resolve(),
             max_body_bytes=2 * 1024 * 1024,
             max_file_bytes=512 * 1024,
             max_fetch_bytes=1024 * 1024,
+            max_tool_result_chars=8000,
             max_tool_rounds=10,
             search_url_template="https://www.bing.com/search?format=rss&q={query}",
             allowed_web_ports=(80, 443),
@@ -158,11 +169,16 @@ def load_settings(config_path: Path) -> Settings:
         max_tokens=int(model.get("max_tokens", defaults.max_tokens)),
         request_timeout_seconds=int(model.get("request_timeout_seconds", defaults.request_timeout_seconds)),
         disable_thinking=bool(model.get("disable_thinking", defaults.disable_thinking)),
+        context_window=int(model.get("context_window", defaults.context_window)),
+        context_reserve_tokens=int(model.get("context_reserve_tokens", defaults.context_reserve_tokens)),
+        token_counting=str(model.get("token_counting", defaults.token_counting)).strip().lower(),
+        chars_per_token=float(model.get("chars_per_token", defaults.chars_per_token)),
         workspace=_configured_path(str(_env("LOCAL_AGENT_WORKSPACE", files.get("workspace", "./workspace"))), config_path.parent),
         static_root=_configured_path(str(_env("LOCAL_AGENT_STATIC_ROOT", files.get("static_root", "./ui/dist"))), config_path.parent),
         max_body_bytes=int(limits.get("max_body_bytes", defaults.max_body_bytes)),
         max_file_bytes=int(limits.get("max_file_bytes", defaults.max_file_bytes)),
         max_fetch_bytes=int(limits.get("max_fetch_bytes", defaults.max_fetch_bytes)),
+        max_tool_result_chars=int(limits.get("max_tool_result_chars", defaults.max_tool_result_chars)),
         max_tool_rounds=int(limits.get("max_tool_rounds", defaults.max_tool_rounds)),
         search_url_template=str(web.get("search_url_template", defaults.search_url_template)),
         allowed_web_ports=tuple(int(port) for port in allowed_ports),
@@ -180,6 +196,20 @@ def load_settings(config_path: Path) -> Settings:
         raise ValueError("web.search_url_template must contain {query}.")
     if any(port < 1 or port > 65535 for port in settings.allowed_web_ports):
         raise ValueError("web.allowed_ports contains an invalid port.")
+    if settings.context_window < 2048:
+        raise ValueError("model.context_window must be at least 2048.")
+    if not 256 <= settings.context_reserve_tokens < settings.context_window:
+        raise ValueError("model.context_reserve_tokens must be at least 256 and smaller than context_window.")
+    if settings.max_tokens > settings.context_reserve_tokens:
+        raise ValueError("model.max_tokens cannot exceed model.context_reserve_tokens.")
+    if settings.token_counting not in {"estimate", "llama_cpp"}:
+        raise ValueError("model.token_counting must be 'estimate' or 'llama_cpp'.")
+    if not 1.0 <= settings.chars_per_token <= 8.0:
+        raise ValueError("model.chars_per_token must be between 1 and 8.")
+    if settings.max_tool_result_chars < 500:
+        raise ValueError("limits.max_tool_result_chars must be at least 500.")
+    if settings.request_timeout_seconds < 1:
+        raise ValueError("model.request_timeout_seconds must be positive.")
     return settings
 
 
@@ -203,6 +233,8 @@ def public_settings() -> dict[str, Any]:
         "port": PORT,
         "model_name": MODEL_NAME,
         "model_label": SETTINGS.model_label,
+        "context_window": SETTINGS.context_window,
+        "context_reserve_tokens": SETTINGS.context_reserve_tokens,
         "workspace": str(WORKSPACE),
         "static_root": str(STATIC_ROOT),
     }
@@ -625,15 +657,144 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], 
         return {"error": str(exc)}, trace
 
 
-def call_model(messages: list[dict[str, Any]]) -> dict[str, Any]:
+class ModelContextError(RuntimeError):
+    """Raised when the model server rejects an oversized prompt."""
+
+
+class ModelTimeoutError(RuntimeError):
+    """Raised when a slow local generation exceeds its configured timeout."""
+
+
+def _model_endpoint(path: str) -> str:
+    parsed = urllib.parse.urlparse(MODEL_API)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get(SETTINGS.api_key_env) if SETTINGS.api_key_env else None
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def estimate_prompt_tokens(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+    serialized = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, separators=(",", ":"))
+    return max(1, int(len(serialized) / SETTINGS.chars_per_token) + 1)
+
+
+def prompt_token_count(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+    if SETTINGS.token_counting != "llama_cpp":
+        return estimate_prompt_tokens(messages, tools)
+    template_payload: dict[str, Any] = {
+        "messages": messages,
+        "tools": tools,
+        "add_generation_prompt": True,
+    }
+    if SETTINGS.disable_thinking:
+        template_payload["chat_template_kwargs"] = {"enable_thinking": False}
+    try:
+        rendered = _post_json(_model_endpoint("/apply-template"), template_payload, 15)
+        prompt = rendered.get("prompt")
+        if not isinstance(prompt, str):
+            raise ValueError("The template endpoint did not return a prompt.")
+        tokenized = _post_json(_model_endpoint("/tokenize"), {"content": prompt, "add_special": False}, 15)
+        tokens = tokenized.get("tokens")
+        if not isinstance(tokens, list):
+            raise ValueError("The tokenize endpoint did not return tokens.")
+        return len(tokens)
+    except Exception:
+        return estimate_prompt_tokens(messages, tools)
+
+
+def _truncate_context(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n[Older tool output compacted to preserve room for the answer.]\n"
+    if limit <= len(marker) + 80:
+        return value[:limit]
+    tail = min(240, max(80, limit // 6))
+    head = limit - len(marker) - tail
+    return value[:head] + marker + value[-tail:]
+
+
+def serialize_tool_result(result: dict[str, Any]) -> str:
+    content = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    return _truncate_context(content, SETTINGS.max_tool_result_chars)
+
+
+def _compact_tool_calls(tool_calls: list[dict[str, Any]], argument_limit: int) -> list[dict[str, Any]]:
+    compacted = copy.deepcopy(tool_calls)
+    for call in compacted:
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        arguments = function.get("arguments")
+        if isinstance(arguments, str) and len(arguments) > argument_limit:
+            function["arguments"] = json.dumps({
+                "context_note": "Large arguments omitted after the tool completed successfully."
+            })
+    return compacted
+
+
+def prepare_messages(
+    messages: list[dict[str, Any]],
+    *,
+    allow_tools: bool,
+    aggressive: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    candidate = copy.deepcopy(messages)
+    tools = TOOLS if allow_tools else []
+    budget = SETTINGS.context_window - SETTINGS.context_reserve_tokens
+
+    for message in candidate:
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            message["content"] = _truncate_context(str(message.get("content") or ""), 500)
+            message["tool_calls"] = _compact_tool_calls(message["tool_calls"], 1200)
+        elif message.get("role") == "tool":
+            message["content"] = _truncate_context(str(message.get("content") or ""), SETTINGS.max_tool_result_chars)
+
+    count = prompt_token_count(candidate, tools)
+    if count <= budget:
+        return candidate, count
+
+    last_user = max((index for index, message in enumerate(candidate) if message.get("role") == "user"), default=1)
+    if last_user > 1:
+        candidate = [candidate[0], *candidate[last_user:]]
+        count = prompt_token_count(candidate, tools)
+        if count <= budget:
+            return candidate, count
+
+    limits = (3000, 1400, 600, 300) if not aggressive else (1000, 400, 200)
+    for limit in limits:
+        for message in candidate:
+            if message.get("role") == "tool":
+                message["content"] = _truncate_context(str(message.get("content") or ""), limit)
+            elif message.get("role") == "assistant" and message.get("tool_calls"):
+                message["tool_calls"] = _compact_tool_calls(message["tool_calls"], max(300, limit))
+        count = prompt_token_count(candidate, tools)
+        if count <= budget:
+            return candidate, count
+
+    raise ValueError(
+        f"The current request is too large for the configured context window of {SETTINGS.context_window} tokens. "
+        "Start a new chat or split the request into smaller parts."
+    )
+
+
+def call_model(messages: list[dict[str, Any]], *, allow_tools: bool = True) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": MODEL_NAME,
         "messages": messages,
-        "tools": TOOLS,
-        "tool_choice": "auto",
         "temperature": SETTINGS.temperature,
         "max_tokens": SETTINGS.max_tokens,
     }
+    if allow_tools:
+        payload["tools"] = TOOLS
+        payload["tool_choice"] = "auto"
     if SETTINGS.disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -647,24 +808,31 @@ def call_model(messages: list[dict[str, Any]]) -> dict[str, Any]:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 400 and ("context size" in detail.lower() or "exceeds the available context" in detail.lower()):
+            raise ModelContextError(detail[:800]) from exc
         raise RuntimeError(f"The model server returned HTTP {exc.code}: {detail[:800]}") from exc
+    except TimeoutError as exc:
+        raise ModelTimeoutError("The local model took too long to finish this step.") from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise ModelTimeoutError("The local model took too long to finish this step.") from exc
         raise RuntimeError(f"The model server is unavailable at {MODEL_API}.") from exc
 
 
 def run_agent(client_messages: list[dict[str, Any]]) -> dict[str, Any]:
-    cleaned = []
+    cleaned_reversed = []
     total_chars = 0
-    for item in client_messages[-30:]:
+    for item in reversed(client_messages[-30:]):
         role = item.get("role")
         content = item.get("content")
         if role not in {"user", "assistant"} or not isinstance(content, str):
             continue
         content = content[:30000]
-        total_chars += len(content)
-        if total_chars > 120000:
+        if cleaned_reversed and total_chars + len(content) > 120000:
             break
-        cleaned.append({"role": role, "content": content})
+        total_chars += len(content)
+        cleaned_reversed.append({"role": role, "content": content})
+    cleaned = list(reversed(cleaned_reversed))
     if not cleaned or cleaned[-1]["role"] != "user":
         raise ValueError("The final message must come from the user.")
 
@@ -672,13 +840,44 @@ def run_agent(client_messages: list[dict[str, Any]]) -> dict[str, Any]:
     trace: list[dict[str, Any]] = []
 
     for _ in range(SETTINGS.max_tool_rounds):
-        response = call_model(messages)
+        try:
+            messages, prompt_tokens = prepare_messages(messages, allow_tools=True)
+            response = call_model(messages)
+        except ModelContextError:
+            try:
+                messages, prompt_tokens = prepare_messages(messages, allow_tools=False, aggressive=True)
+                response = call_model(messages, allow_tools=False)
+            except (ModelContextError, ModelTimeoutError, ValueError):
+                return {
+                    "content": (
+                        "The research was stopped safely before the context window filled completely. "
+                        "Start a new chat or ask for fewer sources in one turn."
+                    ),
+                    "trace": trace,
+                    "usage": {},
+                    "context": {"window": SETTINGS.context_window, "safely_stopped": True},
+                }
+        except ModelTimeoutError:
+            return {
+                "content": (
+                    "The local model safely stopped a step that exceeded the configured time limit. "
+                    "The server is still running; try fewer sources in one turn."
+                ),
+                "trace": trace,
+                "usage": {},
+                "context": {"window": SETTINGS.context_window, "safely_stopped": True},
+            }
         choice = response.get("choices", [{}])[0]
         message = choice.get("message", {})
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             content = message.get("content") or "The model did not return a final answer."
-            return {"content": content, "trace": trace, "usage": response.get("usage", {})}
+            return {
+                "content": content,
+                "trace": trace,
+                "usage": response.get("usage", {}),
+                "context": {"prompt_tokens": prompt_tokens, "window": SETTINGS.context_window},
+            }
 
         messages.append({
             "role": "assistant",
@@ -701,10 +900,34 @@ def run_agent(client_messages: list[dict[str, Any]]) -> dict[str, Any]:
                 "role": "tool",
                 "tool_call_id": call.get("id", name),
                 "name": name,
-                "content": json.dumps(result, ensure_ascii=False),
+                "content": serialize_tool_result(result),
             })
 
-    raise RuntimeError(f"The agent exceeded the limit of {SETTINGS.max_tool_rounds} tool rounds.")
+    final_messages = copy.deepcopy(messages)
+    final_messages[0]["content"] += (
+        "\n\nNo more tools are available for this turn. Give the best final answer now using the results already collected."
+    )
+    try:
+        final_messages, prompt_tokens = prepare_messages(final_messages, allow_tools=False, aggressive=True)
+        response = call_model(final_messages, allow_tools=False)
+        message = response.get("choices", [{}])[0].get("message", {})
+        content = message.get("content") or "The research finished, but the model did not return a final answer."
+        return {
+            "content": content,
+            "trace": trace,
+            "usage": response.get("usage", {}),
+            "context": {"prompt_tokens": prompt_tokens, "window": SETTINGS.context_window},
+        }
+    except (ModelContextError, ModelTimeoutError, ValueError):
+        return {
+            "content": (
+                "The research was stopped safely before the context window filled completely. "
+                "Start a new chat or ask for fewer sources in one turn."
+            ),
+            "trace": trace,
+            "usage": {},
+            "context": {"window": SETTINGS.context_window, "safely_stopped": True},
+        }
 
 
 def tree_snapshot() -> dict[str, Any]:

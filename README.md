@@ -6,7 +6,7 @@ Local Agent Workspace lets a model search the public web and work with text file
 
 ![Local Agent Workspace interface](docs/screenshot.png)
 
-> Early release: `v0.2.0`. Review the [security model](SECURITY.md) before using it with important files.
+> Early release: `v0.3.0`. Review the [security model](SECURITY.md) before using it with important files.
 
 ## What it provides
 
@@ -19,6 +19,8 @@ Local Agent Workspace lets a model search the public web and work with text file
 - Loopback-only server by default, JSON-only writes, origin checks, and a restrictive content security policy.
 - Responsive React UI with a file tree, read-only preview, and visible tool activity.
 - One-click **New chat** reset that clears client-side context without unloading the model.
+- Context budgeting that counts llama.cpp prompt tokens, bounds tool output, drops stale chat history, and reserves room for the final answer.
+- Safe final-answer fallback when a tool-heavy turn reaches its context or tool-round budget.
 - Double-click Windows launchers after a local model server is available.
 - Python standard-library backend with no runtime package installation.
 
@@ -41,7 +43,7 @@ The model can only request the functions declared by the policy layer. Every fil
 - Python 3.10 or newer.
 - Node.js 20.19 or newer when running from a source checkout. Node is only used to build the UI.
 - A local model server with an OpenAI-compatible `/v1/chat/completions` endpoint and tool-calling support.
-- A model-server context of at least **8192 tokens** is recommended. Tool schemas consume context before the user's message is added.
+- A model-server context of at least **8192 tokens** is recommended; **16384** is a better starting point for multi-page research. Tool schemas consume context before the user's message is added.
 
 The backend itself is cross-platform, but the convenience launchers are currently PowerShell-based.
 
@@ -55,8 +57,11 @@ llama-server.exe `
   --alias local-model `
   --host 127.0.0.1 `
   --port 8080 `
-  --ctx-size 8192 `
+  --ctx-size 16384 `
   --parallel 1 `
+  --gpu-layers auto `
+  --fit on `
+  --flash-attn on `
   --jinja
 ```
 
@@ -82,8 +87,13 @@ Important fields:
 | `model.api_url` | `http://127.0.0.1:8080/v1/chat/completions` | OpenAI-compatible endpoint. |
 | `model.name` | `local-model` | Model name or alias sent to the endpoint. |
 | `model.disable_thinking` | `false` | Sends the llama.cpp-compatible `enable_thinking: false` template option when enabled. |
+| `model.request_timeout_seconds` | `900` | Per-model-step timeout; large local prompts can take several minutes. |
+| `model.context_window` | `8192` | Must match the context configured in the model server. |
+| `model.context_reserve_tokens` | `2048` | Space kept free for the final answer. Must be at least `model.max_tokens`. |
+| `model.token_counting` | `estimate` | Use `llama_cpp` for exact local `/apply-template` and `/tokenize` counting, with automatic estimation fallback. |
 | `files.workspace` | `./workspace` | The only directory exposed to file tools. |
 | `web.allowed_ports` | `80`, `443` | Destination ports allowed for public web fetching. |
+| `limits.max_tool_result_chars` | `8000` | Per-result ceiling before content re-enters the model context. |
 
 Environment variables can override common deployment values without editing the file:
 
