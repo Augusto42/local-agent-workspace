@@ -1,0 +1,34 @@
+# Local configuration and runtime state
+config.json
+.run/
+logs/
+workspace/
+
+# Models, credentials, and environment files
+*.gguf
+*.ggml
+*.safetensors
+*.bin
+*.pt
+*.pth
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Frontend
+ui/node_modules/
+ui/dist/
+npm-debug.log*
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
