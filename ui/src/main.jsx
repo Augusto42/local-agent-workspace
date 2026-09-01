@@ -16,6 +16,7 @@ function Icon({ name, size = 18 }) {
   const props = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true };
   const paths = {
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
+    plus: <><path d="M12 5v14M5 12h14" /></>,
     refresh: <><path d="M20 11a8.1 8.1 0 1 0 .1 3" /><path d="M20 4v7h-7" /></>,
     folder: <><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" /></>,
     file: <><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v5h5M9 13h6M9 17h5" /></>,
@@ -143,6 +144,16 @@ function App() {
     }
   };
 
+  const startNewChat = () => {
+    if (busy) return;
+    setMessages([]);
+    setTrace([]);
+    setPrompt('');
+    setError('');
+    setPreview(null);
+    textareaRef.current?.focus();
+  };
+
   return (
     <div className={`app-shell ${leftOpen ? '' : 'left-closed'} ${rightOpen ? '' : 'right-closed'}`}>
       <header className="topbar">
@@ -151,6 +162,7 @@ function App() {
         <span className="local-status"><span />Local</span>
         <span className="top-separator" />
         <span className="model-label">{config.model_label}</span>
+        <button className="new-chat-button" onClick={startNewChat} disabled={busy} aria-label="New chat" title="Clear the context and start a new chat"><Icon name="plus" size={17} /><span>New chat</span></button>
         <button className="activity-toggle" onClick={() => setRightOpen(!rightOpen)}>Activity</button>
       </header>
 

@@ -6,7 +6,7 @@ Local Agent Workspace lets a model search the public web and work with text file
 
 ![Local Agent Workspace interface](docs/screenshot.png)
 
-> Early release: `v0.1.0`. Review the [security model](SECURITY.md) before using it with important files.
+> Early release: `v0.2.0`. Review the [security model](SECURITY.md) before using it with important files.
 
 ## What it provides
 
@@ -18,6 +18,7 @@ Local Agent Workspace lets a model search the public web and work with text file
 - Path traversal and Windows reparse-point protection.
 - Loopback-only server by default, JSON-only writes, origin checks, and a restrictive content security policy.
 - Responsive React UI with a file tree, read-only preview, and visible tool activity.
+- One-click **New chat** reset that clears client-side context without unloading the model.
 - Double-click Windows launchers after a local model server is available.
 - Python standard-library backend with no runtime package installation.
 
